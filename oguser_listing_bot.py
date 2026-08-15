@@ -2,13 +2,14 @@
 OGUsers Listing Formatter Bot + Multi-Source Pastebin Watcher
 ----------------------------------------------------------------
 1) Send: @handle price   (e.g. "@cooltag 250")
-   Bot replies with a ready-to-copy OGUsers listing.
+   Bot replies with a ready-to-copy single-listing OGUsers post.
 
 2) Bot polls one or more Pastebin raw URLs on an interval, and when a
    paste changes it:
      - shows you exactly which lines were added/removed
-     - auto-drafts a ready-to-copy OGUsers listing for every new line
-       that parses as "handle price"
+     - auto-drafts ONE consolidated "catalog" post covering every new
+       line that parses as "handle price" (matches your standard
+       OGUsers thread format)
      - flags any new line it couldn't parse, so nothing gets missed
 
 Env vars needed (set in Railway):
@@ -21,13 +22,12 @@ Env vars needed (set in Railway):
   PASTEBIN_POLL_SECONDS  - optional, defaults to 60
 
 Deploy the same way as your other Railway bots:
-  requirements.txt -> python-telegram-bot==21.*, requests
+  requirements.txt -> python-telegram-bot[job-queue]==21.*, requests
   Procfile / start command -> python oguser_listing_bot.py
 """
 
 import os
 import re
-import hashlib
 import logging
 import requests
 from telegram import Update
@@ -39,6 +39,9 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ALLOWED_USER_ID = int(os.environ["ALLOWED_USER_ID"])
 PASTEBIN_POLL_SECONDS = int(os.environ.get("PASTEBIN_POLL_SECONDS", "60"))
+
+CONTACT_LINK = "http://t.me/bradsocials"
+MIDDLEMAN_LINK = "https://oguser.com/Laugh"
 
 # Matches "@handle price" or "handle price", price can have $ / commas.
 # Reused both for manual Telegram input and for parsing paste lines.
@@ -69,12 +72,33 @@ def parse_sources(raw: str) -> dict:
 
 SOURCES = parse_sources(os.environ.get("PASTEBIN_RAW_URLS", ""))
 
-# ---------- Listing formatting ----------
+# ---------- Formatting helpers ----------
 
-def build_listing(handle: str, price: str) -> tuple[str, str]:
-    """Formats a standard OGUsers-style sale thread body. Tweak this template
-    freely to match whatever category/format you actually post under."""
-    clean_price = price.replace(",", "")
+def format_price(price: str) -> str:
+    """Formats a raw price string with thousands separators, e.g. '1200' -> '1,200'."""
+    clean = price.replace(",", "")
+    try:
+        if "." in clean:
+            whole, frac = clean.split(".", 1)
+            return f"{int(whole):,}.{frac}"
+        return f"{int(clean):,}"
+    except ValueError:
+        return price  # fall back to whatever was given
+
+
+def try_parse_line(line: str):
+    """Attempts to parse a line as 'handle price'. Returns
+    (handle, price) or None if it doesn't match."""
+    match = INPUT_PATTERN.match(line.strip())
+    if not match:
+        return None
+    return match.group("handle"), match.group("price")
+
+
+def build_single_listing(handle: str, price: str) -> tuple[str, str]:
+    """Formats a single standalone OGUsers-style sale thread (title + body),
+    used for one-off manual @handle price messages."""
+    clean_price = format_price(price)
     title = f"[Selling] @{handle} - ${clean_price}"
 
     body = f"""{title}
@@ -90,14 +114,32 @@ DM or comment to purchase. First come first served."""
     return title, body
 
 
-def try_parse_line(line: str):
-    """Attempts to parse a paste line as 'handle price'. Returns
-    (handle, price) or None if it doesn't match."""
-    match = INPUT_PATTERN.match(line.strip())
-    if not match:
-        return None
-    return match.group("handle"), match.group("price")
+def build_catalog_post(entries: list, source_url: str) -> str:
+    """Formats the consolidated 'new additions' catalog post used whenever
+    a watched paste gets new entries. `entries` is a list of (handle, price)."""
+    listing_lines = "\n".join(
+        f"@ {handle} {format_price(price)}" for handle, price in entries
+    )
 
+    return f"""A trusted middleman is always used during the sale of usernames to ensure proper business.
+
+[👉 Click here to contact me 👈]({CONTACT_LINK})
+
+Other usernames I have include:
+
+
+{listing_lines}
+
+[FULL LIST HERE]({source_url})
+
+@[Laugh]({MIDDLEMAN_LINK}) middleman is preferred.
+
+All prices are negotiable.
+
+I am open to enquires / questions."""
+
+
+# ---------- Manual message handler ----------
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -114,7 +156,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     handle, price = parsed
-    title, body = build_listing(handle, price)
+    title, body = build_single_listing(handle, price)
 
     reply = f"Title:\n{title}\n\nBody:\n{body}"
     await update.message.reply_text(reply)
@@ -181,27 +223,33 @@ async def check_one_source(context: ContextTypes.DEFAULT_TYPE, label: str, url: 
         chat_id=ALLOWED_USER_ID, text="\n".join(msg_parts)
     )
 
-    # Auto-draft listings for every new line that parses cleanly
+    # Build ONE consolidated catalog post covering every new line that parses
+    entries = []
     unparsed = []
     for line in added:
         parsed = try_parse_line(line)
         if parsed:
-            handle, price = parsed
-            title, body = build_listing(handle, price)
-            await context.bot.send_message(
-                chat_id=ALLOWED_USER_ID,
-                text=f"Draft for {line}:\n\nTitle:\n{title}\n\nBody:\n{body}",
-            )
+            entries.append(parsed)
         else:
             unparsed.append(line)
+
+    if entries:
+        post = build_catalog_post(entries, url)
+        await context.bot.send_message(
+            chat_id=ALLOWED_USER_ID,
+            text=post,
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+        )
 
     if unparsed:
         unparsed_text = "\n".join(f"  - {ln}" for ln in unparsed)
         await context.bot.send_message(
             chat_id=ALLOWED_USER_ID,
             text=(
-                f"Couldn't auto-draft {len(unparsed)} new line(s) from "
-                f"[{label}] (format didn't match 'handle price'):\n{unparsed_text}"
+                f"Couldn't include {len(unparsed)} new line(s) from "
+                f"[{label}] in the catalog post (format didn't match "
+                f"'handle price'):\n{unparsed_text}"
             ),
         )
 
