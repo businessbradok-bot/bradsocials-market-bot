@@ -4,13 +4,14 @@ OGUsers Listing Formatter Bot + Multi-Source Pastebin Watcher
 1) Send: @handle price   (e.g. "@cooltag 250")
    Bot replies with a ready-to-copy single-listing OGUsers post.
 
-2) Bot polls one or more Pastebin raw URLs on an interval, and when a
-   paste changes it:
-     - shows you exactly which lines were added/removed
-     - auto-drafts ONE consolidated "catalog" post covering every new
-       line that parses as "handle price" (matches your standard
-       OGUsers thread format)
-     - flags any new line it couldn't parse, so nothing gets missed
+2) Send: /template  (or /template <source label>)
+   Bot replies with your standard catalog post template, ready for
+   you to paste usernames into by hand.
+
+3) Bot polls one or more Pastebin raw URLs on an interval, and when a
+   paste changes it just notifies you with the added/removed lines -
+   it does NOT auto-generate a post. Use /template when you're ready
+   to make a new listing.
 
 Env vars needed (set in Railway):
   TELEGRAM_BOT_TOKEN     - from @BotFather
@@ -31,7 +32,13 @@ import re
 import logging
 import requests
 from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
+from telegram.ext import (
+    ApplicationBuilder,
+    MessageHandler,
+    CommandHandler,
+    ContextTypes,
+    filters,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -42,9 +49,9 @@ PASTEBIN_POLL_SECONDS = int(os.environ.get("PASTEBIN_POLL_SECONDS", "60"))
 
 CONTACT_LINK = "http://t.me/bradsocials"
 MIDDLEMAN_LINK = "https://oguser.com/Laugh"
+FULL_LIST_LINK = "https://t.me/bradsocialsmarket"
 
 # Matches "@handle price" or "handle price", price can have $ / commas.
-# Reused both for manual Telegram input and for parsing paste lines.
 INPUT_PATTERN = re.compile(
     r"^@?(?P<handle>[A-Za-z0-9._]{1,30})\s+\$?(?P<price>[\d,]+(?:\.\d+)?)\s*$"
 )
@@ -114,13 +121,10 @@ DM or comment to purchase. First come first served."""
     return title, body
 
 
-def build_catalog_post(entries: list, source_url: str) -> str:
-    """Formats the consolidated 'new additions' catalog post used whenever
-    a watched paste gets new entries. `entries` is a list of (handle, price)."""
-    listing_lines = "\n".join(
-        f"@ {handle} {format_price(price)}" for handle, price in entries
-    )
-
+def build_template() -> str:
+    """Formats the blank catalog post template, ready for you to fill in
+    usernames by hand. The FULL LIST HERE link always points at your
+    Telegram market channel."""
     return f"""A trusted middleman is always used during the sale of usernames to ensure proper business.
 
 [👉 Click here to contact me 👈]({CONTACT_LINK})
@@ -128,9 +132,11 @@ def build_catalog_post(entries: list, source_url: str) -> str:
 Other usernames I have include:
 
 
-{listing_lines}
+@ 
+@ 
+@ 
 
-[FULL LIST HERE]({source_url})
+[FULL LIST HERE]({FULL_LIST_LINK})
 
 @[Laugh]({MIDDLEMAN_LINK}) middleman is preferred.
 
@@ -139,7 +145,18 @@ All prices are negotiable.
 I am open to enquires / questions."""
 
 
-# ---------- Manual message handler ----------
+# ---------- Command handlers ----------
+
+async def template_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != ALLOWED_USER_ID:
+        return
+
+    template = build_template()
+    await update.message.reply_text(
+        template, parse_mode="Markdown", disable_web_page_preview=True
+    )
+
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -151,7 +168,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not parsed:
         await update.message.reply_text(
-            "Didn't catch that. Send it like:\n@handle 250"
+            "Didn't catch that. Send it like:\n@handle 250\n\n"
+            "Or use /template to get a blank listing template."
         )
         return
 
@@ -162,7 +180,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(reply)
 
 
-# ---------- Pastebin watcher ----------
+# ---------- Pastebin watcher (notify only, no auto-draft) ----------
 
 def fetch_paste_lines(url: str):
     """Returns the paste's non-empty lines, or None on fetch failure."""
@@ -207,7 +225,7 @@ async def check_one_source(context: ContextTypes.DEFAULT_TYPE, label: str, url: 
     if not added and not removed:
         return  # order changed only, nothing meaningful to report
 
-    msg_parts = [f"Update on [{label}]:"]
+    msg_parts = [f"[{label}] list updated. Use /template when ready to post."]
 
     if added:
         msg_parts.append(f"\n+ {len(added)} added:")
@@ -223,38 +241,8 @@ async def check_one_source(context: ContextTypes.DEFAULT_TYPE, label: str, url: 
         chat_id=ALLOWED_USER_ID, text="\n".join(msg_parts)
     )
 
-    # Build ONE consolidated catalog post covering every new line that parses
-    entries = []
-    unparsed = []
-    for line in added:
-        parsed = try_parse_line(line)
-        if parsed:
-            entries.append(parsed)
-        else:
-            unparsed.append(line)
-
-    if entries:
-        post = build_catalog_post(entries, url)
-        await context.bot.send_message(
-            chat_id=ALLOWED_USER_ID,
-            text=post,
-            parse_mode="Markdown",
-            disable_web_page_preview=True,
-        )
-
-    if unparsed:
-        unparsed_text = "\n".join(f"  - {ln}" for ln in unparsed)
-        await context.bot.send_message(
-            chat_id=ALLOWED_USER_ID,
-            text=(
-                f"Couldn't include {len(unparsed)} new line(s) from "
-                f"[{label}] in the catalog post (format didn't match "
-                f"'handle price'):\n{unparsed_text}"
-            ),
-        )
-
     logger.info(
-        f"[{label}] Change processed: {len(added)} added, {len(removed)} removed."
+        f"[{label}] Change notified: {len(added)} added, {len(removed)} removed."
     )
 
 
@@ -265,6 +253,7 @@ async def check_all_sources(context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("template", template_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     if SOURCES:
